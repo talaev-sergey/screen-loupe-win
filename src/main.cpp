@@ -154,6 +154,18 @@ static void Tick() {
     MagSetWindowSource(g_mag, src);
     // Перерисовываем и при неподвижном курсоре: под лупой может идти видео.
     InvalidateRect(g_mag, nullptr, FALSE);
+
+    // Когда после Win+Z отпускают Win, Explorer поднимает панель задач над всеми
+    // topmost-окнами. Видимое окно над кругом — возвращаем затемнение наверх
+    // (круг принадлежит ему и поднимается следом). Невидимые служебные окна
+    // Windows висят выше всегда, их не считаем.
+    for (HWND h = GetWindow(g_lens, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) {
+        if (IsWindowVisible(h)) {
+            SetWindowPos(g_dim, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            break;
+        }
+    }
 }
 
 static void Show() {
