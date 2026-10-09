@@ -45,6 +45,14 @@ Win+Z.
 .\ScreenLoupe-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES
 ```
 
+В скриптах не ждите установку через `Start-Process -Wait`: он ждёт и лупу,
+которую установщик запускает в конце, то есть вечно. Ждите только сам
+установщик:
+
+```powershell
+(Start-Process .\ScreenLoupe-Setup.exe '/VERYSILENT /SUPPRESSMSGBOXES' -PassThru).WaitForExit()
+```
+
 ## Автообновление
 
 Лупа обновляется сама, без окон и вопросов:
