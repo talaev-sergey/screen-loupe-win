@@ -15,18 +15,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build exe
-        run: |
-          cmake -B build -A x64
-          cmake --build build --config Release
-
-      - name: Build installer
+      # Версия из тега попадает и в exe (по ней работает автообновление),
+      # и в установщик. Сборки без тега — 0.0.0: они обновятся до релиза.
+      - name: Build
         run: |
           $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0' }
+          cmake -B build -A x64 -DAPP_VERSION="$version"
+          cmake --build build --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           iscc /DAppVersion=$version installer\ScreenLoupe.iss
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $hash = (Get-FileHash dist\ScreenLoupe-Setup.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  ScreenLoupe-Setup.exe" | Out-File dist\checksums.txt -Encoding ascii
+          $version | Out-File dist\version.txt -Encoding ascii
 
       - uses: actions/upload-artifact@v7
         with:
@@ -37,4 +38,4 @@ jobs:
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist\ScreenLoupe-Setup.exe dist\checksums.txt --title "Screen Loupe $env:GITHUB_REF_NAME" --generate-notes
+        run: gh release create $env:GITHUB_REF_NAME dist\ScreenLoupe-Setup.exe dist\checksums.txt dist\version.txt --title "Screen Loupe $env:GITHUB_REF_NAME" --generate-notes

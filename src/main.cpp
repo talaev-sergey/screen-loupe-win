@@ -10,13 +10,19 @@
 //   Этот элемент показывает экран без наших окон (фильтр-лист), поэтому при
 //   увеличении 1× круг выглядит как дырка в затемнении, а при >1× — как лупа;
 // - клавиатура и колесо — low-level хуки в отдельном потоке, чтобы занятый
-//   отрисовкой главный поток не тормозил ввод во всей системе.
+//   отрисовкой главный поток не тормозил ввод во всей системе;
+// - обновление — фоновый поток: при старте сверяет версию с последним релизом
+//   на GitHub и молча ставит новую.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <bcrypt.h>
 #include <magnification.h>
+#include <winhttp.h>
 
 #include <atomic>
 #include <climits>
+#include <cstdio>
+#include <string>
 
 // --- настройки ---
 constexpr int RADIUS = 130;                 // радиус лупы, px
@@ -26,6 +32,10 @@ constexpr int BORDER = 2;                   // толщина рамки кру�
 constexpr COLORREF BORDER_COLOR = RGB(200, 200, 200);
 constexpr double ZOOM_STEP = 0.5;           // прирост увеличения на щелчок колеса
 constexpr double ZOOM_MAX = 8.0;
+constexpr DWORD UPDATE_DELAY_MS = 60 * 1000;        // первая проверка обновления после старта
+constexpr DWORD UPDATE_RETRY_MS = 15 * 60 * 1000;   // повтор, если сеть недоступна
+constexpr wchar_t RELEASE_URL[] =
+    L"https://github.com/talaev-sergey/screen-loupe-win/releases/latest/download/";
 
 enum : UINT { WM_APP_TOGGLE = WM_APP + 1, WM_APP_HIDE, WM_APP_WHEEL, WM_APP_MOUSEHOOK };
 
@@ -167,6 +177,109 @@ static void Hide() {
     ShowWindow(g_dim, SW_HIDE);
 }
 
+// --- обновление ---
+
+// Скачивает файл целиком в память. WinHTTP ничего не кэширует, поэтому
+// version.txt всегда свежий; прокси берётся системный.
+static bool Fetch(const wchar_t* name, std::string& out) {
+    std::wstring url = std::wstring(RELEASE_URL) + name;
+    wchar_t host[256], path[1024];
+    URL_COMPONENTS u = {};
+    u.dwStructSize = sizeof(u);
+    u.lpszHostName = host;
+    u.dwHostNameLength = ARRAYSIZE(host);
+    u.lpszUrlPath = path;
+    u.dwUrlPathLength = ARRAYSIZE(path);
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &u))
+        return false;
+    HINTERNET s = WinHttpOpen(L"ScreenLoupe/" APP_VERSION, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                              nullptr, nullptr, 0);
+    HINTERNET c = s ? WinHttpConnect(s, host, u.nPort, 0) : nullptr;
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, nullptr, nullptr,
+                                         WINHTTP_FLAG_SECURE)
+                    : nullptr;
+    DWORD status = 0, len = sizeof(status);
+    bool ok = r && WinHttpSendRequest(r, nullptr, 0, nullptr, 0, 0, 0) &&
+              WinHttpReceiveResponse(r, nullptr) &&
+              WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                  nullptr, &status, &len, nullptr) &&
+              status == 200;
+    out.clear();
+    while (ok) {
+        DWORD n = 0;
+        ok = WinHttpQueryDataAvailable(r, &n);
+        if (!ok || !n)
+            break;
+        size_t old = out.size();
+        out.resize(old + n);
+        ok = WinHttpReadData(r, &out[old], n, &n);
+        out.resize(old + n);
+    }
+    for (HINTERNET h : {r, c, s})
+        if (h)
+            WinHttpCloseHandle(h);
+    return ok;
+}
+
+// "1.2.3" → 1002003. Неразборчивое — 0, то есть старее любой версии.
+static long ParseVersion(const char* s) {
+    int a = 0, b = 0, c = 0;
+    return sscanf_s(s, "%d.%d.%d", &a, &b, &c) == 3 ? a * 1000000L + b * 1000L + c : 0;
+}
+
+static std::string Sha256Hex(const std::string& data) {
+    UCHAR h[32];
+    BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+               reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+               static_cast<ULONG>(data.size()), h, sizeof(h));
+    char hex[65];
+    for (int i = 0; i < 32; i++)
+        sprintf_s(hex + 2 * i, 3, "%02x", h[i]);
+    return hex;
+}
+
+// Молча ставит последний релиз, если он новее. Установщик сам останавливает
+// эту копию и запускает новую. Без сети пробуем снова; не прошла проверка
+// хеша — ждём следующего запуска.
+static DWORD WINAPI UpdateThread(void*) {
+    Sleep(UPDATE_DELAY_MS);  // после входа в Windows сеть поднимается не сразу
+    std::string version, sums, setup;
+    while (!Fetch(L"version.txt", version))
+        Sleep(UPDATE_RETRY_MS);
+    if (ParseVersion(version.c_str()) <= ParseVersion(APP_VERSION))
+        return 0;
+    if (!Fetch(L"checksums.txt", sums) || !Fetch(L"ScreenLoupe-Setup.exe", setup) ||
+        sums.find(Sha256Hex(setup) + "  ScreenLoupe-Setup.exe") == std::string::npos)
+        return 0;
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring exe = std::wstring(tmp) + L"ScreenLoupe-Setup.exe";
+    HANDLE f = CreateFileW(exe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        return 0;
+    DWORD written = 0;
+    bool ok = WriteFile(f, setup.data(), static_cast<DWORD>(setup.size()), &written, nullptr) &&
+              written == setup.size();
+    CloseHandle(f);
+    if (!ok)
+        return 0;
+
+    while (g_visible)  // не обрывать лупу посреди урока
+        Sleep(1000);
+    std::wstring cmd = L"\"" + exe + L"\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=\"" +
+                       tmp + L"ScreenLoupe-update.log\"";
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    return 0;
+}
+
 static LRESULT CALLBACK DimProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP_TOGGLE:
@@ -233,6 +346,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetZoom(1.0);
 
     CreateThread(nullptr, 0, InputThread, nullptr, 0, &g_inputThread);
+    CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
