@@ -7,7 +7,7 @@
 // - затемнение — неподвижное полупрозрачное окно на весь виртуальный экран;
 //   оно не перерисовывается, пока лупа включена;
 // - круг — маленькое окно поверх затемнения с элементом Magnification API.
-//   Этот элемент показывает экран без наших окон (фильтр-лист), поэтому при
+//   Этот элемент показывает экран без наших окон, поэтому при
 //   увеличении 1× круг выглядит как дырка в затемнении, а при >1× — как лупа;
 // - клавиатура и колесо — low-level хуки в отдельном потоке, чтобы занятый
 //   отрисовкой главный поток не тормозил ввод во всей системе;
@@ -328,6 +328,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_dim = CreateWindowExW(ex, L"ScreenLoupeDim", L"Screen Loupe", WS_POPUP,
                             0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     SetLayeredWindowAttributes(g_dim, 0, DIM_ALPHA, LWA_ALPHA);
+    // Лупа не должна видеть затемнение. MagSetWindowFilterList на Windows 11
+    // возвращает успех, но окно не исключает; исключение из захвата экрана
+    // Magnification API соблюдает. Своё окно лупа исключает сама.
+    SetWindowDisplayAffinity(g_dim, WDA_EXCLUDEFROMCAPTURE);
 
     // Круг принадлежит затемнению, поэтому всегда лежит над ним.
     const int d = 2 * RADIUS, m = 2 * (RADIUS - BORDER);
@@ -341,8 +345,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!g_mag)
         Fail(L"Не удалось создать окно лупы.");
     SetWindowRgn(g_mag, CreateEllipticRgn(0, 0, m + 1, m + 1), FALSE);
-    HWND own[] = {g_dim, g_lens};
-    MagSetWindowFilterList(g_mag, MW_FILTERMODE_EXCLUDE, 2, own);  // лупа не видит себя
     SetZoom(1.0);
 
     CreateThread(nullptr, 0, InputThread, nullptr, 0, &g_inputThread);
