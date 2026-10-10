@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#include <dwmapi.h>
 #include <magnification.h>
 #include <winhttp.h>
 
@@ -27,7 +28,7 @@
 // --- настройки ---
 constexpr int RADIUS = 130;                 // радиус лупы, px
 constexpr BYTE DIM_ALPHA = 150;             // затемнение снаружи (0..255)
-constexpr UINT FRAME_MS = 10;               // период кадра; Windows округлит до ~15.6 мс (~64 к/с)
+constexpr UINT FRAME_MS = 10;               // таймер кадра; сам кадр ждёт DWM, то есть частоту экрана
 constexpr int BORDER = 2;                   // толщина рамки круга, px
 constexpr COLORREF BORDER_COLOR = RGB(200, 200, 200);
 constexpr double ZOOM_STEP = 0.5;           // прирост увеличения на щелчок колеса
@@ -140,13 +141,12 @@ static void SetZoom(double z) {
 }
 
 static void Tick() {
+    // Кадр начинаем сразу после того, как DWM собрал предыдущий, а окно круга
+    // двигаем только после перерисовки картинки: так оба изменения попадают в
+    // один кадр. Иначе окно уезжает раньше картинки, и она дрожит при движении.
+    DwmFlush();
     POINT p;
     GetCursorPos(&p);
-    if (p.x != g_last.x || p.y != g_last.y) {
-        g_last = p;
-        SetWindowPos(g_lens, nullptr, p.x - RADIUS, p.y - RADIUS, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
     // Источник — квадрат с центром в курсоре, в zoom раз меньше круга. Центр круга
     // тоже в курсоре, поэтому клик попадает ровно туда, куда показывает увеличение.
     int s = static_cast<int>((2 * (RADIUS - BORDER)) / g_zoom);
@@ -154,6 +154,12 @@ static void Tick() {
     MagSetWindowSource(g_mag, src);
     // Перерисовываем и при неподвижном курсоре: под лупой может идти видео.
     InvalidateRect(g_mag, nullptr, FALSE);
+    UpdateWindow(g_mag);
+    if (p.x != g_last.x || p.y != g_last.y) {
+        g_last = p;
+        SetWindowPos(g_lens, nullptr, p.x - RADIUS, p.y - RADIUS, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 
     // Когда после Win+Z отпускают Win, Explorer поднимает панель задач над всеми
     // topmost-окнами. Видимое окно над кругом — возвращаем затемнение наверх
