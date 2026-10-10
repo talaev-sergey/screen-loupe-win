@@ -16,6 +16,7 @@
 // - обновление — фоновый поток: при старте сверяет версию с последним релизом
 //   на GitHub и молча ставит новую.
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <bcrypt.h>
 #include <dwmapi.h>
@@ -181,9 +182,10 @@ static void PaintRing() {
             double r = std::hypot(x + 0.5 - RADIUS, y + 0.5 - RADIUS);
             double a = std::clamp(std::min(outer - r, r - inner) + 0.5, 0.0, 1.0);
             // UpdateLayeredWindow ждёт цвет, уже умноженный на прозрачность.
-            auto ch = [a](int c) { return static_cast<DWORD>(c * a + 0.5); };
-            px[y * d + x] = ch(255) << 24 | ch(GetRValue(BORDER_COLOR)) << 16 |
-                            ch(GetGValue(BORDER_COLOR)) << 8 | ch(GetBValue(BORDER_COLOR));
+            // COLORREF — 0x00BBGGRR, пиксель — 0xAARRGGBB.
+            auto ch = [a](DWORD c) { return static_cast<DWORD>((c & 0xFF) * a + 0.5); };
+            px[y * d + x] = ch(255) << 24 | ch(BORDER_COLOR) << 16 |
+                            ch(BORDER_COLOR >> 8) << 8 | ch(BORDER_COLOR >> 16);
         }
     }
     HGDIOBJ old = SelectObject(dc, bmp);
