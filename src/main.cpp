@@ -9,6 +9,8 @@
 // - круг — маленькое окно поверх затемнения с элементом Magnification API.
 //   Этот элемент показывает экран без наших окон, поэтому при
 //   увеличении 1× круг выглядит как дырка в затемнении, а при >1× — как лупа;
+// - обводка — отдельное окно над кругом с попиксельной прозрачностью: край
+//   региона окна всегда ступенчатый, а у обводки края сглажены;
 // - клавиатура и колесо — low-level хуки в отдельном потоке, чтобы занятый
 //   отрисовкой главный поток не тормозил ввод во всей системе;
 // - обновление — фоновый поток: при старте сверяет версию с последним релизом
@@ -20,8 +22,10 @@
 #include <magnification.h>
 #include <winhttp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -40,7 +44,7 @@ constexpr wchar_t RELEASE_URL[] =
 
 enum : UINT { WM_APP_TOGGLE = WM_APP + 1, WM_APP_HIDE, WM_APP_WHEEL, WM_APP_MOUSEHOOK };
 
-static HWND g_dim, g_lens, g_mag;
+static HWND g_dim, g_lens, g_mag, g_ring;
 static DWORD g_inputThread;
 static std::atomic<bool> g_visible;
 static double g_zoom;
@@ -140,6 +144,58 @@ static void SetZoom(double z) {
     MagSetWindowTransform(g_mag, &t);
 }
 
+// Круг из пикселей, чей центр не дальше r от центра окна. Обводка считает
+// прозрачность по тем же центрам пикселей, поэтому ступенчатый край круга
+// всегда лежит под её непрозрачной серединой.
+static HRGN CircleRgn(double r) {
+    HRGN rgn = CreateRectRgn(0, 0, 0, 0);
+    for (int y = 0; y < 2 * RADIUS; y++) {
+        double dy = y + 0.5 - RADIUS;
+        if (dy * dy > r * r)
+            continue;
+        double dx = std::sqrt(r * r - dy * dy);
+        HRGN row = CreateRectRgn(static_cast<int>(std::ceil(RADIUS - 0.5 - dx)), y,
+                                 static_cast<int>(std::floor(RADIUS - 0.5 + dx)) + 1, y + 1);
+        CombineRgn(rgn, rgn, row, RGN_OR);
+        DeleteObject(row);
+    }
+    return rgn;
+}
+
+// Рисует обводку один раз: кольцо толщиной BORDER, края сглажены на пиксель.
+static void PaintRing() {
+    const int d = 2 * RADIUS;
+    const double outer = RADIUS - 1, inner = outer - BORDER;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = d;
+    bi.bmiHeader.biHeight = -d;  // строки сверху вниз
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    auto px = static_cast<DWORD*>(bits);
+    for (int y = 0; y < d; y++) {
+        for (int x = 0; x < d; x++) {
+            double r = std::hypot(x + 0.5 - RADIUS, y + 0.5 - RADIUS);
+            double a = std::clamp(std::min(outer - r, r - inner) + 0.5, 0.0, 1.0);
+            // UpdateLayeredWindow ждёт цвет, уже умноженный на прозрачность.
+            auto ch = [a](int c) { return static_cast<DWORD>(c * a + 0.5); };
+            px[y * d + x] = ch(255) << 24 | ch(GetRValue(BORDER_COLOR)) << 16 |
+                            ch(GetGValue(BORDER_COLOR)) << 8 | ch(GetBValue(BORDER_COLOR));
+        }
+    }
+    HGDIOBJ old = SelectObject(dc, bmp);
+    SIZE size = {d, d};
+    POINT origin = {};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(g_ring, nullptr, nullptr, &size, dc, &origin, 0, &blend, ULW_ALPHA);
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
 static void Tick() {
     // Кадр начинаем сразу после того, как DWM собрал предыдущий, а окно круга
     // двигаем только после перерисовки картинки: так оба изменения попадают в
@@ -149,7 +205,7 @@ static void Tick() {
     GetCursorPos(&p);
     // Источник — квадрат с центром в курсоре, в zoom раз меньше круга. Центр круга
     // тоже в курсоре, поэтому клик попадает ровно туда, куда показывает увеличение.
-    int s = static_cast<int>((2 * (RADIUS - BORDER)) / g_zoom);
+    int s = static_cast<int>((2 * RADIUS) / g_zoom);
     RECT src = {p.x - s / 2, p.y - s / 2, p.x - s / 2 + s, p.y - s / 2 + s};
     MagSetWindowSource(g_mag, src);
     // Перерисовываем и при неподвижном курсоре: под лупой может идти видео.
@@ -157,15 +213,19 @@ static void Tick() {
     UpdateWindow(g_mag);
     if (p.x != g_last.x || p.y != g_last.y) {
         g_last = p;
-        SetWindowPos(g_lens, nullptr, p.x - RADIUS, p.y - RADIUS, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // Круг и обводку двигаем одной операцией, чтобы они не разъезжались.
+        HDWP dwp = BeginDeferWindowPos(2);
+        for (HWND h : {g_lens, g_ring})
+            dwp = DeferWindowPos(dwp, h, nullptr, p.x - RADIUS, p.y - RADIUS, 0, 0,
+                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        EndDeferWindowPos(dwp);
     }
 
     // Когда после Win+Z отпускают Win, Explorer поднимает панель задач над всеми
-    // topmost-окнами. Видимое окно над кругом — возвращаем затемнение наверх
-    // (круг принадлежит ему и поднимается следом). Невидимые служебные окна
-    // Windows висят выше всегда, их не считаем.
-    for (HWND h = GetWindow(g_lens, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) {
+    // topmost-окнами. Видимое окно над обводкой — возвращаем затемнение наверх
+    // (круг с обводкой принадлежат ему и поднимаются следом). Невидимые
+    // служебные окна Windows висят выше всегда, их не считаем.
+    for (HWND h = GetWindow(g_ring, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) {
         if (IsWindowVisible(h)) {
             SetWindowPos(g_dim, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -182,6 +242,7 @@ static void Show() {
     g_last = {LONG_MIN, LONG_MIN};
     Tick();
     ShowWindow(g_lens, SW_SHOWNOACTIVATE);
+    ShowWindow(g_ring, SW_SHOWNOACTIVATE);
     SetTimer(g_dim, 1, FRAME_MS, nullptr);
     g_visible = true;
     PostThreadMessageW(g_inputThread, WM_APP_MOUSEHOOK, TRUE, 0);
@@ -191,6 +252,7 @@ static void Hide() {
     g_visible = false;
     PostThreadMessageW(g_inputThread, WM_APP_MOUSEHOOK, FALSE, 0);
     KillTimer(g_dim, 1);
+    ShowWindow(g_ring, SW_HIDE);
     ShowWindow(g_lens, SW_HIDE);
     ShowWindow(g_dim, SW_HIDE);
 }
@@ -336,7 +398,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.lpszClassName = L"ScreenLoupeDim";
     RegisterClassW(&wc);
     wc.lpfnWndProc = DefWindowProcW;
-    wc.hbrBackground = CreateSolidBrush(BORDER_COLOR);  // фон круга виден как рамка
     wc.lpszClassName = L"ScreenLoupeLens";
     RegisterClassW(&wc);
 
@@ -351,19 +412,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // Magnification API соблюдает. Своё окно лупа исключает сама.
     SetWindowDisplayAffinity(g_dim, WDA_EXCLUDEFROMCAPTURE);
 
-    // Круг принадлежит затемнению, поэтому всегда лежит над ним.
-    const int d = 2 * RADIUS, m = 2 * (RADIUS - BORDER);
+    // Круг принадлежит затемнению, обводка — кругу, поэтому каждое окно всегда
+    // лежит над предыдущим. Край круга проходит по середине обводки.
+    const int d = 2 * RADIUS;
+    const double edge = RADIUS - 1 - BORDER / 2.0;
     g_lens = CreateWindowExW(ex, L"ScreenLoupeLens", L"", WS_POPUP,
                              0, 0, d, d, g_dim, nullptr, inst, nullptr);
     SetLayeredWindowAttributes(g_lens, 0, 255, LWA_ALPHA);
-    SetWindowRgn(g_lens, CreateEllipticRgn(0, 0, d + 1, d + 1), FALSE);
+    SetWindowRgn(g_lens, CircleRgn(edge), FALSE);
 
     g_mag = CreateWindowW(WC_MAGNIFIER, L"", WS_CHILD | WS_VISIBLE,
-                          BORDER, BORDER, m, m, g_lens, nullptr, inst, nullptr);
+                          0, 0, d, d, g_lens, nullptr, inst, nullptr);
     if (!g_mag)
         Fail(L"Не удалось создать окно лупы.");
-    SetWindowRgn(g_mag, CreateEllipticRgn(0, 0, m + 1, m + 1), FALSE);
+    SetWindowRgn(g_mag, CircleRgn(edge), FALSE);
     SetZoom(1.0);
+
+    g_ring = CreateWindowExW(ex, L"ScreenLoupeLens", L"", WS_POPUP,
+                             0, 0, d, d, g_lens, nullptr, inst, nullptr);
+    PaintRing();
+    // Обводку лупа тоже видеть не должна: при движении в круг попадала бы
+    // обводка с прошлого кадра.
+    SetWindowDisplayAffinity(g_ring, WDA_EXCLUDEFROMCAPTURE);
 
     CreateThread(nullptr, 0, InputThread, nullptr, 0, &g_inputThread);
     CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
